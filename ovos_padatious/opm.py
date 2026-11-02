@@ -18,7 +18,7 @@ import re
 import string
 import time
 from collections import defaultdict
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from copy import deepcopy
 from functools import lru_cache
 from os.path import expanduser, isfile
@@ -460,7 +460,10 @@ class PadatiousPipeline(ConfidenceMatcherPipeline):
         # interleave, leaving the claim recording one registration's content
         # while the container actually holds the other's. Per-key, not
         # global, so unrelated keys still apply concurrently.
-        self._registration_key_locks: Dict[tuple, Lock] = {}
+        # Each entry is [lock, holders]; the entry is dropped when the last
+        # holder or waiter is done with it, so a detach for a name that was
+        # never registered leaves nothing behind.
+        self._registration_key_locks: Dict[tuple, list] = {}
         self._registration_key_locks_guard = Lock()
 
         # legacy registration contract (kept for back-compat)
@@ -892,7 +895,7 @@ class PadatiousPipeline(ConfidenceMatcherPipeline):
         # and an identical copy is not skipped against a claim that is gone.
         with ExitStack() as locks:
             for lang in sorted(self.containers):
-                locks.enter_context(self._lock_for_key((lang, intent_name)))
+                locks.enter_context(self._key_lock((lang, intent_name)))
             with self._applied_registrations_lock:
                 for key in [k for k in self._applied_registrations if k[1] == intent_name]:
                     del self._applied_registrations[key]
@@ -1079,8 +1082,6 @@ class PadatiousPipeline(ConfidenceMatcherPipeline):
                 for slot, values in slot_blacklist.items()}
 
         if lang in self.containers:
-            if message.data['name'] not in self.registered_intents:
-                self.registered_intents.append(message.data['name'])
             key = (lang, message.data['name'])
             content = self._registration_content(message)
             # Claim-through-apply is one atomic step per key: two concurrent
@@ -1089,7 +1090,11 @@ class PadatiousPipeline(ConfidenceMatcherPipeline):
             # not interleave their claim and their add(), or the claim can
             # end up recording one registration's content while the
             # container actually holds the other's.
-            with self._lock_for_key(key):
+            with self._key_lock(key):
+                # under the key lock, so a detach that held it has finished and
+                # the roster and the container cannot disagree
+                if message.data['name'] not in self.registered_intents:
+                    self.registered_intents.append(message.data['name'])
                 with self._applied_registrations_lock:
                     if content is not None and self._applied_registrations.get(key) == content:
                         LOG.debug('Padatious intent already registered with the same '
@@ -1173,12 +1178,22 @@ class PadatiousPipeline(ConfidenceMatcherPipeline):
             if content is not None and self._applied_registrations.get(key) == content:
                 del self._applied_registrations[key]
 
-    def _lock_for_key(self, key: tuple) -> Lock:
-        """The one lock that serializes claim-through-apply for ``key``,
-        created on first use. Per-key so registrations for different
-        (lang, name) keys still apply concurrently."""
+    @contextmanager
+    def _key_lock(self, key: tuple):
+        """Hold the one lock that serializes claim-through-apply for ``key``.
+        Per-key so registrations for different (lang, name) keys still apply
+        concurrently; the entry is dropped once nobody holds or waits on it."""
         with self._registration_key_locks_guard:
-            return self._registration_key_locks.setdefault(key, Lock())
+            entry = self._registration_key_locks.setdefault(key, [Lock(), 0])
+            entry[1] += 1
+        try:
+            with entry[0]:
+                yield
+        finally:
+            with self._registration_key_locks_guard:
+                entry[1] -= 1
+                if entry[1] == 0:
+                    del self._registration_key_locks[key]
 
     def register_entity(self, message):
         """Messagebus handler for registering entities.

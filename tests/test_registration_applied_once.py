@@ -113,6 +113,31 @@ class TestDualEmittedIntentAppliedOnce(_Pipeline):
             remove.join(10)
         self.assertFalse(remove.is_alive())
         self.assertNotIn(f"{SKILL_ID}:time", self.pipeline.registered_intents)
+    def test_roster_is_updated_only_under_the_key_lock(self):
+        """A registration waiting behind a detach must add its name to the
+        roster after the detach finished, not before, or the container holds
+        an intent the roster does not list."""
+        key = (LANG, f"{SKILL_ID}:time")
+        with self.pipeline._key_lock(key):
+            register = threading.Thread(target=self.pipeline.register_intent,
+                                        args=(legacy_msg(),))
+            register.start()
+            register.join(0.3)
+            self.assertTrue(register.is_alive())
+            self.assertNotIn(f"{SKILL_ID}:time", self.pipeline.registered_intents)
+        register.join(10)
+        self.assertFalse(register.is_alive())
+        self.assertIn(f"{SKILL_ID}:time", self.pipeline.registered_intents)
+
+    def test_key_locks_are_not_kept_for_names_never_registered(self):
+        for n in range(20):
+            self.pipeline.handle_detach_intent(Message(
+                "detach_intent", {"intent_name": f"{SKILL_ID}:ghost{n}.intent"}))
+        self.pipeline.register_intent(legacy_msg())
+        self.pipeline.handle_detach_intent(Message(
+            "detach_intent", {"intent_name": f"{SKILL_ID}:time.intent"}))
+        self.assertEqual(self.pipeline._registration_key_locks, {})
+
     def test_rejected_registration_does_not_shadow_a_later_one(self):
         with mock.patch.object(PadatiousPipeline, "_unpack_object", return_value=None):
             self.pipeline.register_intent(legacy_msg())
